@@ -91,8 +91,8 @@ def main():
     parser.add_argument("--name", required=True, help="Beaker job name")
     parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs (default: 1)")
     parser.add_argument("--preemptible", action="store_true", help="Use preemptible instances")
-    parser.add_argument("--priority", default="normal", choices=["low", "normal", "high", "urgent"])
-    parser.add_argument("--cluster", default=None, help="Specific cluster (default: ai2/jupiter)")
+    parser.add_argument("--priority", default="high", choices=["low", "normal", "high", "urgent"])
+    parser.add_argument("--cluster", default=None, help="Specific cluster (default: saturn, neptune, rhea, triton)")
     parser.add_argument("--no_sync", action="store_true", help="Skip git sync (use existing gantry repo state)")
     args = parser.parse_args()
 
@@ -134,7 +134,7 @@ def main():
     if args.cluster:
         clusters = [args.cluster]
     else:
-        clusters = ["ai2/jupiter"]
+        clusters = ["ai2/saturn", "ai2/neptune", "ai2/rhea", "ai2/triton"]
 
     # Weka mounts
     gantry_kwargs["weka"] = [
