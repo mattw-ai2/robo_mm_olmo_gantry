@@ -1,0 +1,1695 @@
+"""Classes the compute metrics given ground truth/prediction pairs"""
+import base64
+import dataclasses
+import io
+import json
+import logging
+import os
+import re
+import random
+import math
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor
+from html import escape as html_escape
+from pathlib import Path
+from typing import List, Tuple, Dict, Any
+
+import numpy as np
+import torch
+import torch.distributed as dist
+from PIL import Image
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import cdist
+from torchmetrics import MeanMetric
+
+from .vqa import vqa_score, anls_metric, relaxed_correctness, scifi_relaxed_correctness, \
+    a_okvqa_score, select_mc_option, mmmu_score, real_world_qa_score, math_vista_score, \
+    select_perception_test_option, select_ego_schema_option, nextqa_mc, muir_bench_mc
+from .temp_compass_utils import temp_compass_score
+from .mlvu_utils import mlvu_ssc_score, mlvu_summary_score
+from ..html_utils import build_html_table, postprocess_prompt, BoxesToVisualize, \
+    get_html_image_with_boxes
+from ..io import write_file
+from ..torch_util import (
+    get_global_rank,
+    get_world_size, barrier,
+)
+from ..util import flatten_list, extract_points, extract_bboxes, extract_points_from_point_count
+
+log = logging.getLogger(__name__)
+
+
+def get_openai_key():
+    key = os.environ.get("OPENAI_API_KEY")
+    if key is None:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    return key
+
+
+def mean_metric(v):
+    metric = MeanMetric(nan_strategy="error")
+    metric.update(np.mean(v) if len(v)>0 else 0, len(v))
+    return metric
+
+
+@dataclasses.dataclass
+class HtmlTable:
+    """Returned as special metric for visualizing predictions"""
+    rows: List[Dict[str, Any]]
+
+    def get_html(self):
+        return build_html_table(self.rows)
+
+
+def annotation_to_box(points, point_dist=4):
+    to_show = []
+    for point in points:
+        if len(point) == 2:
+            x, y = point
+            to_show.append([x-point_dist, y-point_dist, x+point_dist, y+point_dist])
+        else:
+            to_show.append(point)
+    return to_show
+
+
+def gather_examples_as_html(
+    n_examples, voc, metadatas, predictions,
+    scores=None, fix_width=True, pred_points=None, gt_points=None
+) -> HtmlTable:
+    """Builds a HTML table visualization of the predictions"""
+
+    n = len(predictions["predictions"])
+    if n_examples is not None:
+        # Divide by world size since we will aggregate visualization across all processes
+        n = min(n, n_examples)
+        n = (n + get_world_size() - 1) // get_world_size()
+    rows = []
+    new_tokens = predictions["predictions"]
+    prompt_tokens = predictions["prompts"]
+    for ix in range(n):
+        prompt_text = postprocess_prompt(voc.decode(prompt_tokens[ix][prompt_tokens[ix] >= 0]))
+        metadata = metadatas[ix]
+        pred_seq = new_tokens[ix]
+        pred_txt = voc.decode(pred_seq[pred_seq >= 0])
+
+        image_src = None
+        if "image_url" in metadata:
+            image_src = metadata['image_url']
+        elif "image" in metadata and isinstance(metadata["image"], np.ndarray):
+            img = Image.fromarray(metadata["image"])
+            image_data = io.BytesIO()
+            img.save(image_data, format='JPEG')
+            image_data = image_data.getvalue()
+            image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
+        elif "image" in metadata:
+            with Image.open(metadata["image"]) as img:
+                image_data = io.BytesIO()
+                img.save(image_data, format='JPEG')
+                image_data = image_data.getvalue()
+            image_src = f'data:image/jpeg;base64,{base64.b64encode(image_data).decode()}'
+
+        row = dict()
+        if image_src is not None:
+            ex_pred_points, gt_pred_points = None, None
+            if pred_points is not None:
+                ex_pred_points = pred_points[ix]
+            if gt_points is not None:
+                gt_pred_points = gt_points[ix]
+            if ex_pred_points is None and gt_pred_points is None:
+                row["image"] = f"<img style=\"max-height:500px;max-width:500px;height:auto;width:auto;\" src={image_src}><img>"
+            else:
+                to_show = []
+                if ex_pred_points is not None:
+                    to_show.append(BoxesToVisualize(annotation_to_box(ex_pred_points), "blue", format="xyxy"))
+                if gt_pred_points is not None:
+                    to_show.append(BoxesToVisualize(annotation_to_box(gt_pred_points, 3), "green", format="xyxy"))
+                row["image"] = get_html_image_with_boxes(image_src, to_show)
+        row["prompt"] = html_escape(prompt_text)
+        row["prediction"] = html_escape(pred_txt)
+
+        if "answers" in metadata:
+            gt = metadata["answers"]
+        elif "answer" in metadata:
+            gt = metadata["answer"]
+        elif "caption" in metadata:
+            gt = metadata["caption"]
+        elif "label" in metadata:
+            gt = metadata["label"]
+        else:
+            gt = None
+        if gt is not None:
+            if isinstance(gt, list):
+                gt = "<br>".join(html_escape(x) for x in gt)
+            else:
+                gt = html_escape(gt)
+            row["gt"] = gt
+        if scores is not None:
+            if isinstance(scores[ix], dict):
+                for k, v in scores[ix].items():
+                    if isinstance(v, str):
+                        row[k] = v
+                    else:
+                        row[k] = "" if v is None else f"{v:0.3f}"
+            else:
+                row["score"] = f"{scores[ix]:0.3f}"
+        rows.append(row)
+    return HtmlTable(rows)
+
+
+def get_gcs_url(output_file):
+    assert output_file.startswith("gs://")
+    return f"https://storage.cloud.google.com/{output_file[5:]}?authuser=1"
+
+
+class Evaluator:
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        raise NotImplementedError()
+
+
+class SavePredictions(Evaluator):
+
+    @staticmethod
+    def get_file_name(step, process_index):
+        filename = ""
+        if step is not None:
+            filename += f"step{step}-"
+        if get_world_size() > 1 and process_index is not None:
+            filename += f"shard{process_index}"
+        filename += "predictions"
+        return filename
+
+    def __init__(self, output_dir, json=True, save_tokens=True,
+                 log_examples=10, table=True):
+        self.save_tokens = save_tokens
+        self.output_dir = output_dir
+        self.log_examples = log_examples
+        self.json = json
+        self.table = table
+
+    def __call__(self, metadatas, predictions, tokenizer,
+                 step=None, scores=None):
+        if not self.output_dir.startswith("gs://"):
+            if not os.path.exists(self.output_dir):
+                Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        json_data = []
+        html_data = []
+
+        n_no_eos = 0
+        for tok in new_tokens:
+            if not np.any(tok == tokenizer.eos_token_id):
+                n_no_eos += 1
+        if n_no_eos > 0:
+            logging.warning(f"{n_no_eos}/{len(new_tokens)} ({n_no_eos/len(new_tokens):00.4f}) "
+                            f"examples have no EOS, your inference tokens might be too short")
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            text = tokenizer.decode(pred_seq[pred_seq >= 0])
+            json_row = dict(prediction=text)
+            if self.save_tokens:
+                json_row["n_tokens"] = pred_seq.tolist()
+            prompt_text = postprocess_prompt(tokenizer.decode(prompt_tokens[ex_ix][prompt_tokens[ex_ix] >= 0]))
+            if tokenizer.adds_space:
+                sep = " "
+            else:
+                sep = ""
+            json_row["prompt"] = prompt_text
+            metadata = metadatas[ex_ix]
+            if ex_ix < self.log_examples:
+                log.info("*"*30)
+                if "example_id" in metadata:
+                    log.info(metadata['example_id'])
+                log.info(' '.join((prompt_text + sep + text.replace("\n", "\\n")).split()))
+            json_row.update({k: v for k, v in metadata.items() if isinstance(v, (str, float, int))})
+            json_data.append(json_row)
+        html_data = gather_examples_as_html(self.log_examples, tokenizer, metadatas, predictions)
+
+        json_file = None
+        html_file = None
+        metrics = {}
+
+        if self.json:
+            log.info("Save prediction JSON")
+            if get_world_size() > 1 and self.json:
+                if get_global_rank() == 0:
+                    all_predictions = [None]*get_world_size()
+                    dist.gather_object(json_data, all_predictions)
+                    json_data = flatten_list(all_predictions)
+                else:
+                    dist.gather_object(json_data, None)
+
+            if get_global_rank() == 0:
+                write_file(
+                    self.output_dir,
+                    self.get_file_name(step, None) + ".json",
+                    json.dumps(json_data, indent=2),
+                    save_overwrite=True
+                )
+                log.info("done saving json")
+
+                if self.table:
+                    html_data = gather_examples_as_html(None, tokenizer, metadatas, predictions)
+                    write_file(
+                        self.output_dir,
+                        self.get_file_name(step, None) + ".html",
+                        html_data.get_html(),
+                        save_overwrite=True
+                    )
+                    log.info("done saving html table for rank 0")
+
+        return metrics
+
+
+def is_point_in_region(point: Tuple[float, float], mask: np.ndarray) -> bool:
+    """
+    Check if the point (x, y) is within the region defined by the boolean mask.
+
+    Parameters:
+    - point (tuple of floats): x/y-coordinate of the point
+    - mask (2D numpy array): Boolean mask of shape [H, W] representing the region
+
+    Returns:
+    - bool: True if the point is within the region, False otherwise
+    """
+    height, width = mask.shape
+    x, y = point
+
+    # Round the coordinates to the nearest integer
+    x_int = int(round(x))
+    y_int = int(round(y))
+
+    # Check if the rounded point is within the bounds of the image
+    if x_int < 0 or x_int >= width or y_int < 0 or y_int >= height:
+        return False
+
+    # Check if the point is within the region
+    return mask[y_int, x_int]
+
+
+def is_valid_format(input_string):
+    # Define the regular expression pattern
+    pattern = re.compile(
+        r'^(\(\s*-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?\s*\)\n?)+$|'
+        r'^<point\s+x="\s*\d+(\.\d+)?"\s+y="\s*\d+(\.\d+)?"\s+alt="[\s\S]*?">[\s\S]*?</point>$|'
+        r'^<points\s+(x\d+="\s*\d+(\.\d+)?"\s+y\d+="\s*\d+(\.\d+)?"\s+)+alt="[\s\S]*?">[\s\S]*?</points>$|'
+        r'^<point\s+p=\s*\d{3}\s*,\s*\d{3}\s+alt="[\s\S]*?">[\s\S]*?</point>$|'
+        r'^<points\s+(\d+=\s*\d{3}\s*,\s*\d{3}\s+)+alt="[\s\S]*?">[\s\S]*?</points>$'
+    )
+
+    # Match the entire input string against the pattern
+    match = pattern.fullmatch(input_string.strip())
+
+    # Return True if the match is successful, False otherwise
+    return match is not None
+
+
+def compute_precision(row_ind: np.ndarray, col_ind: np.ndarray, preds: np.ndarray, masks: List[np.ndarray]):
+    cnt = 0
+    for i, j in zip(row_ind, col_ind):
+        if is_point_in_region(preds[i], masks[j]):
+            cnt += 1
+    return cnt / len(preds)
+
+
+def compute_recall(row_ind: np.ndarray, col_ind: np.ndarray, preds: np.ndarray, masks: List[np.ndarray]):
+    cnt = 0
+    for i, j in zip(row_ind, col_ind):
+        if is_point_in_region(preds[i], masks[j]):
+            cnt += 1
+    return cnt / len(masks)
+
+
+def f1_score(precision: float, recall: float, epsilon: float = 1e-10):
+    if precision == 0 or recall == 0:
+        return 0.0
+    return 2 * (precision * recall) / (precision + recall + epsilon)
+
+
+# Metric function aiming to replicate the step-wise accuracy as described in Appendix D.3 of
+# the AndroidControl paper. Very specific to the action space and edge cases in that dataset.
+def compute_stepwise_accuracy(ground_truth, predictions, target_bbs):
+    def parse_action(action_str):
+        action_str = action_str.strip().lower()
+
+        def get_coords(action):
+            coords = re.findall(r'\d+(?:\.\d+)?', action)
+            return (float(coords[0]), float(coords[1])) if len(coords) >= 2 else ''
+
+        if action_str.startswith("click"):
+            return {"type": "click", "coords": get_coords(action_str)}
+        elif action_str.startswith("long press"):
+            return {"type": "long press", "coords": get_coords(action_str)}
+        elif action_str.startswith("type"):
+            return {"type": "type", "text": action_str[5:]}
+        elif action_str.startswith("scroll"):
+            return {"type": "scroll", "direction": action_str.split()[1] if len(action_str.split()) >= 2 else ''}
+        elif action_str == "wait":
+            return {"type": "wait"}
+        elif action_str.startswith("open app"):
+            return {"type": "open_app", "app_name": action_str[9:]}
+        elif action_str == "navigate home":
+            return {"type": "navigate home"}
+        elif action_str == "navigate back":
+            return {"type": "navigate back"}
+        return {"type": None}
+
+    def within_bounding_box(coords, box):
+        x, y = coords[0], coords[1]
+        bbox_values = re.findall(r'\d+\.\d+', box)
+        x1, y1, x2, y2 = [float(val) for val in bbox_values]
+        return x1 <= x <= x2 and y1 <= y <= y2
+
+    all_predictions = []
+    metrics = []
+    for gt_action, pred_action, gt_box in zip(ground_truth, predictions, target_bbs):
+        metric = 'incorrect'  # default to a prediction being incorrect until proven otherwise
+
+        gt_parsed = parse_action(gt_action)
+        pred_parsed = parse_action(pred_action)
+        correct_predictions = 0
+        if gt_parsed["type"] == pred_parsed["type"]:
+            if gt_parsed["type"] in ["click", "long press"]:
+                gt_coords = gt_parsed["coords"]
+                if "coords" in pred_parsed and pred_parsed['coords'] != '' and gt_box != None and gt_parsed['coords'] != '':
+                    pred_coords = pred_parsed["coords"]
+                    if within_bounding_box(pred_coords, gt_box):
+                        correct_predictions += 1
+                        metric = 'correct'
+            elif gt_parsed["type"] == "type" and gt_parsed["text"] == pred_parsed["text"]:
+                correct_predictions += 1
+                metric = 'correct'
+            elif gt_parsed["type"] == "scroll" and gt_parsed["direction"] == pred_parsed["direction"]:
+                correct_predictions += 1
+                metric = 'correct'
+            elif gt_parsed["type"] in ["navigate home", "navigate back", "wait"]:
+                correct_predictions += 1  # These actions have no parameters to compare
+                metric = 'correct'
+            elif gt_parsed["type"] == "open_app" and pred_parsed["app_name"] == gt_parsed["app_name"]:
+                correct_predictions += 1
+                metric = 'correct'
+            else:
+                if gt_parsed == pred_parsed:
+                    correct_predictions += 1
+                    metric = 'correct'
+        else:
+            # Consider open_app and click on app name equivalent
+            if pred_parsed["type"] == "click" and gt_parsed["type"] == "open_app":
+                if gt_box not in [None, ''] and "coords" in pred_parsed and pred_parsed['coords'] != '':
+                    if within_bounding_box(pred_parsed['coords'], gt_box):
+                        correct_predictions += 1
+                        metric = 'correct'
+        all_predictions.append(correct_predictions)
+        metrics.append(metric)
+    # max with 1 since its technically possible for a node to get 0 valid examples
+    return all_predictions, metrics
+
+
+class AndroidControlEval(Evaluator):
+
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+
+        targets = []
+        preds = []
+        target_bbs = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred_text = tokenizer.decode(pred_seq[pred_seq >= 0])
+            if "Action:" in pred_text:
+                pred_text = pred_text.split("Action:")[1].strip()
+
+            # Get metadata needed for metrics and vis
+            preds.append(pred_text)
+            targets.append(metadata["target_action"])
+            target_bbs.append(metadata["target_box"])
+
+        accuracy, corrects = compute_stepwise_accuracy(targets, preds, target_bbs)
+        """
+        if self.n_to_log:
+            for ex in range(self.n_to_log):
+                wandb.log({
+                    #f"{ex}/image": wandb.Image(images[ex], caption=instructions[ex]),
+                    f"{ex}/instruction": instructions[ex],
+                    f"{ex}/target_answer": targets[ex],
+                    f"{ex}/model_answer": preds[ex],
+                    f"{ex}/metric": corrects[ex]
+                })
+        """
+
+        out = {'accuracy': mean_metric(accuracy)}
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, tokenizer, metadatas, predictions, accuracy
+            )
+        return out
+
+
+class PointingEval(Evaluator):
+
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        scores = defaultdict(list)
+        pred_points = []
+        gt_points = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            answer_points = metadata["points"]
+            masks = metadata["masks"]
+            image_w, image_h = metadata["image_size"]
+            abs_preds = extract_points(pred, image_w, image_h)
+
+            if len(answer_points) == 0:
+                precision = recall = f1 = float(abs_preds is None or len(abs_preds) == 0)
+                abs_gts = None
+            else:
+                abs_gts = answer_points
+                if not is_valid_format(pred):
+                    precision = recall = f1 = 0.0
+                else:
+                    abs_preds = np.array(abs_preds)
+                    dists = cdist(abs_preds, abs_gts)
+                    row_ind, col_ind = linear_sum_assignment(dists)
+                    precision = compute_precision(row_ind, col_ind, abs_preds, masks)
+                    recall = compute_recall(row_ind, col_ind, abs_preds, masks)
+                    f1 = f1_score(precision, recall)
+            scores["precision"].append(precision)
+            scores["recall"].append(recall)
+            scores["f1"].append(f1)
+
+            pred_points.append(abs_preds)
+            gt_points.append(abs_gts)
+
+        out = {}
+
+        if "was_lowered" in metadatas[0]:
+            # Get a score with and without lowering
+            lowered = np.array([(x["was_lowered"] or x["was_lowered"] is None) for x in metadatas])
+            nocase = np.array([(not x["was_lowered"] or x["was_lowered"] is None) for x in metadatas])
+            for k, v in scores.items():
+                v = np.array(v)
+                out[k] = mean_metric(v[nocase])
+                out[f"{k}_lower"] = mean_metric(v[lowered])
+        else:
+            for k, v in scores.items():
+                out[k] = mean_metric(v)
+
+        if self.n_to_log:
+            per_example_scores = [{k: scores[k][i] for k in scores} for i in range(len(new_tokens))]
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, per_example_scores,
+                pred_points=pred_points, gt_points=gt_points
+            )
+        return out
+
+
+class PointCountEval(Evaluator):
+
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        all_scores = defaultdict(list)
+        per_category_scores = defaultdict(list)
+        gt_counts_per_device = []
+        pred_points = []
+        gt_points = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            original_pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            pred = original_pred.lower().rstrip(".").strip()
+            gt = metadata["count"]
+
+            pred_int = None
+            parts = pred.split()
+            if parts:
+                try:
+                    pred_int = int(parts[-1])
+                except ValueError:
+                    pass
+
+                if pred_int is None:
+                    if parts[-1] in WORD_TO_NUM:
+                        pred_int = WORD_TO_NUM[parts[-1]]
+
+            # Parse out the int for point and count data
+            if pred_int is None:
+                match = re.match(".*a total of ([0-9]+).*", pred)
+                if match:
+                    pred_int = int(match.group(1))
+
+            if pred_int is None:
+                match = re.match(".*\bnone\b.*", pred)
+                if match:
+                    pred_int = 0
+
+            if pred_int is None:
+                correct, close, valid = 0, 0, False
+            else:
+                correct = gt == pred_int
+                close = abs(gt - pred_int) <= 1
+                valid = True
+            all_scores["close"].append(close)
+            all_scores["valid"].append(valid)
+            all_scores["correct"].append(correct)
+
+            per_category_scores[int(gt)].append(correct)
+            gt_counts_per_device.append(int(gt))
+
+            abs_preds = None
+            abs_gts = None
+            if "image_size" in metadata:
+                image_w, image_h = metadata["image_size"]
+                try:
+                    if len(re.findall(r"(\d+\.\d+),\s*(\d+\.\d+)", original_pred)) > 0:
+                        abs_preds = np.array(extract_points_from_point_count(original_pred, image_w, image_h))
+                except Exception as e:
+                    print("Failed extracting pred points with error - ", e)
+                    abs_preds = None
+                try:
+                    if "points" in metadata:
+                        abs_gts = metadata["metadata/points"]
+                except Exception as e:
+                    print("Failed extracting gt points with error - ", e)
+                    abs_gts = None
+
+            pred_points.append(abs_preds)
+            gt_points.append(abs_gts)
+
+        num_examples_per_device = torch.tensor(len(new_tokens), dtype=torch.int32, device=torch.device("cuda"))
+        num_examples = torch.zeros(get_world_size(), dtype=torch.int32, device=torch.device("cuda"))
+        dist.all_gather_into_tensor(num_examples, num_examples_per_device)
+        max_num_examples = num_examples.detach().cpu().max().item()
+        gt_counts_per_device = torch.tensor(gt_counts_per_device, dtype=torch.int32, device=torch.device("cuda"))
+        gt_counts_per_device = torch.cat(
+            [gt_counts_per_device, torch.full((max_num_examples - len(new_tokens),), -1, dtype=torch.int32, device=torch.device("cuda"))],
+            dim=0,
+        )
+        gt_counts = torch.zeros(get_world_size() * max_num_examples, dtype=torch.int32, device=torch.device("cuda"))
+        dist.all_gather_into_tensor(gt_counts, gt_counts_per_device)
+        gt_counts = gt_counts.detach().cpu().numpy()
+        gt_counts = np.sort(np.unique(gt_counts[gt_counts >= 0]))
+
+        out = {}
+        for k, v in all_scores.items():
+            out[k] = mean_metric(v)
+
+        for k in gt_counts:
+            out[f"correct_{k}"] = mean_metric(per_category_scores[k])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, all_scores["correct"],
+                pred_points=pred_points, gt_points=gt_points
+            )
+        return out
+
+
+def _math_vista_score(args):
+    return math_vista_score(*args)
+
+
+class MathVistaEval(Evaluator):
+    def __init__(self, n_to_log=None, n_threads=4):
+        self.n_to_log = n_to_log
+        self.n_threads = n_threads
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+
+        _args = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            _args.append((pred, metadatas[ex_ix], get_openai_key()))
+
+        scores = []
+        barrier()
+        with ThreadPoolExecutor(max_workers=self.n_threads) as pool:
+            for score in pool.map(_math_vista_score, _args):
+                scores.append(score)
+        barrier()
+
+        out = dict(score=mean_metric(scores))
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, scores)
+        return out
+
+
+class VqaEval(Evaluator):
+
+    def __init__(self, score_fn=("vqa_score",), n_to_log=None):
+        self.metric = score_fn
+        assert len(set(self.metric)) == len(self.metric)
+        self.n_to_log = n_to_log
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            if "answer" in metadata:
+                answers = metadata["answer"]
+            elif "answers" in metadata:
+                answers = metadata["answers"]
+            else:
+                answers = None
+            if isinstance(answers, str):
+                answers = [answers]
+
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            if "Answer:" in pred:
+                pred = pred.split("Answer:")[1].strip()
+                pred_long = pred
+            elif "\n" in pred:
+                preds = [" ".join(x.strip().split()) for x in pred.split("\n")]
+                counts = Counter(preds)
+                max_count = max(counts.values())
+                pred = [x for x in preds if counts[x] == max_count][0]
+            else:
+                pred = " ".join(pred.strip().split())
+
+            for metric in self.metric:
+                if metric == "vqa_score":
+                    score = vqa_score(answers, pred)
+                elif metric == "ansl":
+                    score = max(anls_metric(ref, pred) for ref in answers)
+                elif metric == "relaxed_correctness":
+                    score = max(relaxed_correctness(ans, pred) for ans in answers)
+                elif metric == "scifi_relaxed_correctness":
+                    score = max(scifi_relaxed_correctness(ans, pred) for ans in answers)
+                elif metric == "a_okvqa_score":
+                    score = a_okvqa_score(answers, pred)
+                elif metric == "em":
+                    score = pred.lower() in [x.lower() for x in answers]
+                elif metric == "em_start":
+                    pred = pred.lower()
+                    pred = pred.strip().lstrip()  # deal with " B. ped"
+
+                    answer = answers[0].lower().strip().lstrip()  # match "B." to even "B)" or "B"
+                    answer = answer[0]
+
+                    # Limitation - might match even if pred is "A ball is seen" and GT is A.
+                    score = pred.startswith(answer)
+
+                elif metric == "mc":
+                    options = metadata["option_names"]
+                    get_answer_idx = select_mc_option(pred, options)
+                    score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "perception_test_mc":
+                    get_answer_idx = select_perception_test_option(pred)
+                    score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "ego_schema_mc":
+                    options = metadata["options"]
+                    get_answer_idx = select_ego_schema_option(pred, options)
+                    score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "nextqa_mc":
+                    options = metadata["options"]
+                    answer = answers[0]
+                    score = nextqa_mc(answer, pred, options)
+                elif metric == "muir_bench_mc":
+                    options = metadata["options"]
+                    answer = answers[0]
+                    score = muir_bench_mc(answer, pred, options)
+                elif metric in ["mc_ai2d_transparent", "mc_ai2d_opaque"]: # mc split by transparency
+                    has_transparent_box = metadata["has_transparent_box"]
+                    abc_label = metadata["abc_label"]
+                    # for abc_label, either evaluate on opaque or transparent boxes
+                    if abc_label:
+                        if metric == "mc_ai2d_transparent" and not has_transparent_box:
+                            continue
+                        elif metric == "mc_ai2d_opaque" and has_transparent_box:
+                            continue
+                    options = metadata["option_names"]
+                    get_answer_idx = select_mc_option(pred, options)
+                    score = get_answer_idx == metadata["answer_idx"]
+                elif metric == "mmmu_score":
+                    score = mmmu_score(answers, pred, metadata)
+                elif metric == "real_world_qa_score":
+                    score = real_world_qa_score(metadata["answer"], pred, metadata)
+                elif metric == "seed_bench_score":
+                    options = list("abcd".upper())
+                    get_answer_idx = select_mc_option(pred, options)
+                    score = get_answer_idx == metadata["metadata/answer_idx"][ex_ix]
+                    data_type = metadata["metadata/data_type"][ex_ix].decode("utf-8")
+                    score_lists[f"seed_bench_{data_type}_score"].append(score)
+                elif metric == "math_vista_score":
+                    score = math_vista_score(metadata["answer"], pred, metadata, get_openai_key())
+                else:
+                    raise NotImplementedError(metric)
+                score_lists[metric].append(score)
+
+
+        if "is_human" in metadatas[0]:
+            is_human = np.array([x["is_human"] for x in metadatas])
+            for k, v in list(score_lists.items()):
+                score_lists[f"{k}_human"] = np.array(v)[is_human]
+                score_lists[f"{k}_aug"] = np.array(v)[np.logical_not(is_human)]
+
+        out = {}
+        for k, v in score_lists.items():
+            out[k] = mean_metric(v)
+
+        if self.n_to_log:
+            score_to_log = score_lists[self.metric[0]]
+            if len(score_to_log) != len(metadatas):
+                score_to_log = None
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_to_log)
+        return out
+
+
+WORD_TO_NUM = {
+    'one': 1,
+    'two': 2,
+    'three': 3,
+    'four': 4,
+    'five': 5,
+    'six': 6,
+    'seven': 7,
+    'eight': 8,
+    'nine': 9,
+    'zero': 0,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20
+}
+
+
+class CountEval:
+
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def __call__(self, metadata, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        all_scores = defaultdict(list)
+        points = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadata[ex_ix]
+            pred = tokenizer.decode(pred_seq[pred_seq >= 0]).strip()
+            pred = pred.split()[0].rstrip(".,")
+            gt = metadata["count"]
+            if "image_size" in metadata:
+                w, h = metadata["image_size"]
+                points.append(extract_points(pred, w, h))
+
+            pred_int = None
+            try:
+                pred_int = int(pred)
+            except ValueError:
+                pass
+            pred_int = 1
+
+            if pred_int is None:
+                pred = pred.lower()
+                if pred in WORD_TO_NUM:
+                    pred_int = WORD_TO_NUM[pred]
+
+            # Parse out the int for point and count data
+            if pred_int is None:
+                match = re.match(".*a total of ([0-9]+).*", pred)
+                if match:
+                    pred_int = int(match.group(1))
+
+            if pred_int is None:
+                match = re.match(".*\bnone\b.*", pred)
+                if match:
+                    pred_int = 0
+
+            if pred_int is None:
+                correct, close, valid = 0, 0, False
+            else:
+                correct = gt == pred_int
+                close = abs(gt - pred_int) <= 1
+                valid = True
+            all_scores["close"].append(close)
+            all_scores["valid"].append(valid)
+            all_scores["correct"].append(correct)
+
+        out = {}
+        for k, vals in all_scores.items():
+            out[k] = mean_metric(vals)
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, tokenizer, metadata, predictions, all_scores["correct"],
+                all_scores["valid"], pred_points=points
+            )
+        return out
+
+
+class ClockEval:
+    METRICS = [
+        "overall_close",
+        "overall_exact",
+        "correctly_declines_to_answer",
+        "all_correct",
+        "all_close",
+        "hour_correct",
+        "minute_correct",
+        "second_correct",
+        "minute_close",
+        "second_close",
+    ]
+
+    def __init__(self, n_to_log=None, is_test=False):
+        self.n_to_log = n_to_log
+        self.is_test = is_test
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        err_threshold = 1 if self.is_test else 3
+        all_scores = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            pred = tokenizer.decode(pred_seq[pred_seq >= 0]).strip()
+            metadata = metadatas[ex_ix]
+            scores = {}
+            hour = metadata["hour"]
+            if self.is_test and hour == 12:
+                hour = 0
+            minute = metadata["minute"]
+            if self.is_test and minute == 60:
+                minute = 0
+            second = metadata["second"]
+            answerable = hour > -1 or minute > -1 or second > -1
+
+            scores["gt"] = f"{hour}:{minute}:{second}"
+            if not answerable:
+                scores["correctly_declines_to_answer"] = ":" not in pred
+                scores["overall_close"] = scores["correctly_declines_to_answer"]
+                scores["overall_exact"] = scores["correctly_declines_to_answer"]
+                all_scores.append(scores)
+                continue
+
+            # pred = inputs["metadata/text"][ex_ix].decode("utf-8")
+            parts = pred.split(":")
+            try:
+                pred_hour = int(parts[0].split()[-1])
+                if "PM" in pred and not self.is_test:
+                    pred_hour += 12
+                if self.is_test and pred_hour >= 12:
+                    pred_hour -= 12
+                hour_correct = (pred_hour == hour) or (hour == 0 and pred_hour == 12)
+            except (ValueError, IndexError):
+                hour_correct = False
+            scores["hour_correct"] = hour_correct
+
+            try:
+                minute_pred = int(parts[1].split()[0])
+                if self.is_test and minute_pred == 60:
+                    minute_pred = 0
+                minute_correct = minute_pred == minute
+                minute_close = abs(minute_pred - minute) <= err_threshold
+                if self.is_test:
+                    minute_close = minute_close or abs(minute_pred - minute) == 59
+            except (ValueError, IndexError):
+                minute_correct = 0
+                minute_close = 0
+            scores["minute_correct"] = minute_correct
+            scores["minute_close"] = minute_close
+
+            if second != -1:
+                try:
+                    second_pred = int(parts[2].split()[0])
+                    second_correct = second_pred == second
+                    second_close = abs(second_pred - second) <= err_threshold
+                except (ValueError, IndexError):
+                    second_correct = 0
+                    second_close = 0
+                scores["second_correct"] = second_correct
+                scores["second_close"] = second_close
+                scores["all_correct"] = minute_correct and hour_correct and second_correct
+                scores["all_close"] = minute_close and hour_correct and second_close
+            else:
+                scores["all_correct"] = minute_correct and hour_correct
+                scores["all_close"] = minute_close and hour_correct
+                if self.is_test:
+                    scores["all_close"] = scores["all_close"] or (
+                        abs(hour * 60 + minute - (pred_hour * 60 + minute_pred)) == 719
+                    )
+
+            # FIXME can we remove?
+            scores["overall_close"] = scores["all_close"]
+            scores["overall_exact"] = scores["all_correct"]
+            all_scores.append(scores)
+
+        to_show = []
+        for score in all_scores:
+            to_show.append({k: score[k] for k in ["overall_close", "overall_exact"]})
+
+        out = {}
+        for k in self.METRICS:
+            out[k] = mean_metric([x[k] for x in all_scores if k in x])
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, tokenizer, metadatas, predictions, to_show)
+        return out
+
+
+def compute_area(bbox: list, invalid: float=None) -> float:
+    x1, y1, x2, y2 = bbox
+
+    if (x2 <= x1) or (y2 <= y1):
+        area = invalid
+    else:
+        area = (x2 - x1) * (y2 - y1)
+
+    return area
+
+
+def compute_iou(bbox1: list, bbox2: list, verbose: bool=False):
+    x1, y1, x2, y2 = bbox1
+    x1_, y1_, x2_, y2_ = bbox2
+
+    x1_in = max(x1, x1_)
+    y1_in = max(y1, y1_)
+    x2_in = min(x2, x2_)
+    y2_in = min(y2, y2_)
+
+    intersection = compute_area(bbox=[x1_in, y1_in, x2_in, y2_in], invalid=0.0)
+    area1 = compute_area(bbox1, invalid=0)
+    area2 = compute_area(bbox2, invalid=0)
+    union = area1 + area2 - intersection
+    iou = intersection / (union + 1e-6)
+
+    if verbose:
+        return iou, intersection, union
+
+    return iou
+
+
+class RefExpEval:
+    """Refexp eval, not used by default"""
+
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def __call__(self, inputs, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        scores = []
+        points = []
+        gt_points = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            pred = tokenizer.decode(pred_seq[pred_seq >= 0]).strip()
+            pred_box = None
+            image_w, image_h = inputs["metadata/image_size"][ex_ix]
+
+            pred_box = extract_bboxes(pred, image_w, image_h)
+            x0, y0, w, h = inputs["metadata/bbox"][ex_ix]
+            ref_box = [x0, y0, x0+w, y0+h]
+            gt_points.append([ref_box])
+            if pred_box:
+                iou = compute_iou(pred_box[0], ref_box)
+                points.append([pred_box[0]])
+            else:
+                points.append([])
+                iou = 0
+            scores.append(dict(acc=iou>0.5, iou=iou, valid=bool(pred_box)))
+
+        out = {}
+        for k in scores[0]:
+            vals = [x[k] for x in scores if k in x]
+            out[k] = mean_metric(vals)
+        return out
+
+
+TEMPORAL_ASPECTS = [
+    "action",
+    "direction",
+    "speed",
+    "order",
+    "attribute_change",
+]
+
+
+FINE_GRAINED_TEMPORAL_ASPECTS = [
+    "fine-grained action",
+    "coarse-grained action",
+    "object motion",
+    "camera motion",
+    "absolute speed",
+    "relative speed",
+    "order",
+    "color & light change",
+    "size & shape change",
+    "combined change",
+    "other change",
+]
+
+TEMP_COMPASS_TASKS = ["multi-choice", "yes_no", "caption_matching", "captioning"]
+
+
+class TempCompassEval(Evaluator):
+
+    def __init__(self, task="all", disable_api=False, n_to_log=None):
+        self.tasks = TEMP_COMPASS_TASKS if task == "all" else [task]
+        self.disable_api = disable_api
+        self.n_to_log = n_to_log
+    
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            task = metadata["task"]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            score = temp_compass_score(
+                pred, metadata, get_openai_key(), use_api=not self.disable_api,
+            )
+            score_lists[task].append(score)
+            score_lists["all"].append(score)
+    
+        out = {}
+        for k in self.tasks:
+            out[k] = mean_metric(score_lists[k])
+        out["all"] = mean_metric(score_lists["all"])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_lists["all"]
+            )
+        return out
+
+
+class PlmFGQAEval(Evaluator):
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+        self.all_unique_questions_length = 4217
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        vocab = tokenizer
+        scores = defaultdict(list)
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+
+            pred = pred.lower()
+            pred = pred.strip().lstrip()  # deal with " B. ped"
+
+            answer = metadata["answer"].lower().strip().lstrip()
+            answer = answer[0]  # match "B." to even "B)" or "B"
+
+            # Limitation - might match even if pred is "A ball is seen" and GT is A.
+            score = pred.startswith(answer)
+
+            scores[metadata['question_group_id']].append(score)
+
+        question_to_score_tuples = [score_tuple for score_tuple in scores.items()]
+        # while len(question_to_score_tuples) < self.all_unique_questions_length:
+        #     question_to_score_tuples.append(("", [0, 0]))
+
+        output_list = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(output_list, question_to_score_tuples)
+
+        collected_scores = defaultdict(list)
+        for output in output_list:
+            for key, value in output:
+                collected_scores[key].extend(value)
+
+        m_b_acc = []
+        for key, item in collected_scores.items():
+            m_b_acc.append(0 if 0 in item else 1)
+
+        out = {"m_b_acc": mean_metric(m_b_acc)}
+
+        # if self.n_to_log:
+        #     out["predictions"] = gather_examples_as_html(
+        #         self.n_to_log, vocab, metadatas, predictions, m_b_acc
+        #     )
+        return out
+
+
+VIDEO_MME_CATEGORIES = [
+    "Knowledge",
+    "Film & Television",
+    "Sports Competition",
+    "Artistic Performance",
+    "Life Record",
+    "Multilingual"
+]
+
+
+VIDEO_MME_SUB_CATEGORIES = [
+    "Humanity & History",
+    "Literature & Art",
+    "Biology & Medicine",
+    "Finance & Commerce",
+    "Astronomy",
+    "Geography",
+    "Law",
+    "Life Tip",
+    "Technology",
+    "Animation",
+    "Movie & TV Show",
+    "Documentary",
+    "News Report",
+    "Esports",
+    "Basketball",
+    "Football",
+    "Athletics",
+    "Other Sports",
+    "Stage Play",
+    "Magic Show",
+    "Variety Show",
+    "Acrobatics",
+    "Handicraft",
+    "Food",
+    "Fashion",
+    "Daily Life",
+    "Travel",
+    "Pet & Animal",
+    "Exercise",
+    "Multilingual"
+]
+
+
+VIDEO_MME_TASK_CATEGORIES = [
+    "Temporal Perception",
+    "Spatial Perception",
+    "Attribute Perception",
+    "Action Recognition",
+    "Object Recognition",
+    "OCR Problems",
+    "Counting Problem",
+    "Temporal Reasoning",
+    "Spatial Reasoning",
+    "Action Reasoning",
+    "Object Reasoning",
+    "Information Synopsis",
+]
+
+
+class VideoMMEEval(Evaluator):
+
+    def __init__(self, duration="all", n_to_log=None):
+        self.durations = ["short", "medium", "long"] if duration == "all" else [duration]
+        self.n_to_log = n_to_log
+    
+    def extract_characters_regex(self, s):
+        s = s.strip()
+        answer_prefixes = [
+            "The best answer is",
+            "The correct answer is",
+            "The answer is",
+            "The answer",
+            "The best option is"
+            "The correct option is",
+            "Best answer:"
+            "Best option:",
+            "Answer:",
+            "Option:",
+            "The correct answer",
+            "The correct option",
+        ]
+        for answer_prefix in answer_prefixes:
+            s = s.replace(answer_prefix, "")
+
+        if len(s.split()) > 10 and not re.search("[ABCD]", s):
+            return ""
+        matches = re.search(r'[ABCD]', s)
+        if matches is None:
+            return ""
+        return matches[0]
+    
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            pred = self.extract_characters_regex(pred)
+            answer = metadata["answer"]
+            if pred == "":
+                # I am not sure why, but the original code skipped if the extraction is an empty string
+                continue 
+            score = pred == answer
+
+            duration = metadata["duration"]
+
+            score_lists[f"{duration}"].append(score)
+            score_lists["all"].append(score)
+        
+        out = {}
+        for k in self.durations:
+            out[f"{k}"] = mean_metric(score_lists[f"{k}"])
+        out["all"] = mean_metric(score_lists["all"])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_lists["all"]
+            )
+        return out
+
+
+def _mlvu_gen_score(args):
+    task_type = args.pop("task_type")
+    if task_type == "sub_scene":
+        return mlvu_ssc_score(**args)
+    else:
+        return mlvu_summary_score(**args)
+
+
+class MLVUGenEval(Evaluator):
+    
+    def __init__(self, n_to_log=None, n_threads=4):
+        self.n_to_log = n_to_log
+        self.n_threads = n_threads
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+
+        _args = []
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            _args.append(
+                dict(
+                    task_type=metadatas[ex_ix]["task_type"],
+                    prediction=pred,
+                    metadata=metadatas[ex_ix],
+                    openai_api_key=get_openai_key()
+                )
+            )
+
+        scores = []
+        barrier()
+        with ThreadPoolExecutor(max_workers=self.n_threads) as pool:
+            for score in pool.map(_mlvu_gen_score, _args):
+                scores.append(score)
+        barrier()
+
+        score_lists = defaultdict(list)
+        for score in scores:
+            for k, v in score.items():
+                score_lists[k].append(v)
+        out = {k: mean_metric(v) for k, v in score_lists.items()}
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, [sum(score.values()) for score in scores]
+            )
+        return out
+
+
+class LongVideoBenchEval(Evaluator):
+    DURATIONS = [15, 60, 600, 3600]
+    
+    def __init__(self, n_to_log=None):
+        self.n_to_log = n_to_log
+
+    def parse_multi_choice_response(self, response, all_choices, index2ans):
+        """
+        Changed from MMMU-style complex parsing into simple parsing.
+        Fixed to avoid 'D. A book' be parsed as A.
+        Same as original LongVideoBench paper (from author Haoning Wu), if parsing failed, it will assign a random choice to model.
+        """
+        s = response.strip()
+        answer_prefixes = [
+            "The best answer is",
+            "The correct answer is",
+            "The answer is",
+            "The answer",
+            "The best option is",
+            "The correct option is",
+            "Best answer:",
+            "Best option:",
+        ]
+        for answer_prefix in answer_prefixes:
+            s = s.replace(answer_prefix, "")
+
+        if len(s.split()) > 10 and not re.search("[ABCDE]", s):
+            return random.choice(all_choices)
+
+        matches = re.search(r"[ABCDE]", s)
+        if matches is None:
+            return random.choice(all_choices)
+        return matches[0]
+    
+    def eval_multi_choice(self, gold_i, pred_i):
+        correct = False
+        # only they are exactly the same, we consider it as correct
+        if isinstance(gold_i, list):
+            for answer in gold_i:
+                if answer == pred_i:
+                    correct = True
+                    break
+        else:  # gold_i is a string
+            if gold_i == pred_i:
+                correct = True
+        return correct
+    
+    def get_multi_choice_info(self, options):
+        """
+        Given the list of options for multiple choice question
+        Return the index2ans and all_choices
+        https://github.com/MMMU-Benchmark/MMMU/blob/51ce7f3e829c16bb44bc5445782686b4c3508794/eval/data_utils.py#L54
+        """
+
+        start_chr = "A"
+        all_choices = []
+        index2ans = {}
+        for i, option in enumerate(options):
+            index2ans[chr(ord(start_chr) + i)] = option
+            all_choices.append(chr(ord(start_chr) + i))
+
+        return index2ans, all_choices
+
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        new_tokens = predictions["predictions"]
+        prompt_tokens = predictions["prompts"]
+        vocab = tokenizer
+        score_lists = defaultdict(list)
+
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix]
+            pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+            index2ans, all_choices = self.get_multi_choice_info(metadata["options"])
+
+            parsed_pred = self.parse_multi_choice_response(pred, all_choices, index2ans)
+            score = self.eval_multi_choice(metadata["answer"], parsed_pred)
+
+            duration_group = metadata["duration_group"]
+            score_lists[f"duration_{duration_group}"].append(score)
+            score_lists["all"].append(score)
+        
+        out = {}
+        for k in self.DURATIONS:
+            out[f"duration_{k}"] = mean_metric(score_lists[f"duration_{k}"])
+        out["all"] = mean_metric(score_lists["all"])
+
+        if self.n_to_log:
+            out["predictions"] = gather_examples_as_html(
+                self.n_to_log, vocab, metadatas, predictions, score_lists["all"]
+            )
+        return out
+    
+
+class PointProximityEval(Evaluator):
+    """
+    Evaluator for RoboMolmo tasks that computes distance-based metrics
+    for predicted points compared to ground truth points
+    """
+    
+    def __init__(self, n_to_log=None, threshold_percent=5.0, max_examples=None):
+        """
+        Initialize the evaluator
+        
+        Args:
+            n_to_log: Number of examples to log
+            threshold_percent: Distance threshold as percentage of image dimensions (default 5%)
+            max_examples: Maximum number of examples to evaluate (None = all)
+        """
+        self.n_to_log = n_to_log
+        self.threshold_percent = threshold_percent
+        self.max_examples = max_examples
+    
+    def __call__(self, metadatas, predictions, tokenizer, step=None):
+        import time
+        
+        # Limit the number of examples if specified
+        if self.max_examples is not None:
+            n_examples = min(self.max_examples, len(metadatas))
+            metadatas = metadatas[:n_examples]
+            new_tokens = predictions["predictions"][:n_examples]
+            prompt_tokens = predictions["prompts"][:n_examples]
+        else:
+            new_tokens = predictions["predictions"]
+            prompt_tokens = predictions["prompts"]
+        
+        vocab = tokenizer
+        scores = defaultdict(list)
+        pred_points = []
+        gt_points = []
+        
+        # Add global counters for logging
+        processed = 0
+        skipped = 0
+        
+        log.info(f"Starting PointProximityEval on {len(new_tokens)} examples")
+        start_time = time.time()
+        
+        for ex_ix, pred_seq in enumerate(new_tokens):
+            metadata = metadatas[ex_ix] if ex_ix < len(metadatas) else {}
+            
+            try:
+                pred = vocab.decode(pred_seq[pred_seq >= 0]).strip()
+                log.info(f"pred: {pred}, target_action: {metadata.get('target_action', 'N/A')}")
+                
+                # Handle missing target_action
+                if "target_action" not in metadata:
+                    log.warning(f"Example {ex_ix} missing target_action, skipping")
+                    skipped += 1
+                    pred_points.append(None)
+                    gt_points.append(None)
+                    continue
+                    
+                target_action = metadata["target_action"]
+                
+                if target_action == "DONE":
+                    # Check if prediction is also DONE
+                    is_correct = "DONE" in pred
+                    scores["done_accuracy"].append(float(is_correct))
+                    scores["accuracy"].append(float(is_correct))
+                    scores["distance"].append(float('nan'))
+                    pred_points.append(None)
+                    gt_points.append(None)
+                    processed += 1
+                    continue
+                
+                # Get image dimensions for normalization
+                try:
+                    if "image_size" in metadata:
+                        image_w, image_h = metadata["image_size"]
+                    else:
+                        image_w, image_h = 1280, 960  # Default if not available
+                    
+                    # Parse ground truth coordinates
+                    gt_abs_coords = extract_points(target_action, image_w, image_h)
+                    
+                    if not gt_abs_coords:
+                        log.warning(f"Example {ex_ix}: Could not parse target action: {target_action}")
+                        skipped += 1
+                        pred_points.append(None)
+                        gt_points.append(None)
+                        continue
+                    
+                    # Convert absolute coordinates to percentage (0-100)
+                    gt_coords = []
+                    for point in gt_abs_coords:
+                        x_norm = (point[0] / image_w) * 100.0
+                        y_norm = (point[1] / image_h) * 100.0
+                        gt_coords.append([x_norm, y_norm])
+                    
+                    gt_coord = np.array(gt_coords)
+                    
+                    # Handle special case - check if prediction incorrectly says DONE
+                    if "DONE" in pred:
+                        scores["accuracy"].append(0.0)  # Definitely wrong
+                        scores["distance"].append(float('inf'))
+                        pred_points.append(None)
+                        gt_points.append(gt_abs_coords)  # Use absolute coordinates for visualization
+                        processed += 1
+                        continue
+                    
+                    # Extract points from prediction
+                    abs_preds = extract_points(pred, image_w, image_h)
+                    log.info(f"extracted_predictions (absolute): {abs_preds}")
+                    
+                    if not abs_preds:
+                        # Invalid prediction format
+                        scores["accuracy"].append(0.0)  
+                        scores["distance"].append(float('inf'))
+                        pred_points.append(None)
+                        gt_points.append(gt_abs_coords)  # Use absolute coordinates for visualization
+                        processed += 1
+                        continue
+                    
+                    # Convert to normalized coordinates (0-100)
+                    norm_preds = []
+                    for point in abs_preds:
+                        x_norm = (point[0] / image_w) * 100.0
+                        y_norm = (point[1] / image_h) * 100.0
+                        norm_preds.append([x_norm, y_norm])
+                    
+                    norm_preds = np.array(norm_preds)
+                    log.info(f"normalized_predictions: {norm_preds}")
+                    
+                    # Calculate distances in normalized space (as percentage of image)
+                    norm_dists = cdist(norm_preds, gt_coord)
+                    min_norm_dist_idx = np.argmin(np.diag(norm_dists))
+                    if norm_dists.size > 0:
+                        norm_distance = np.min(norm_dists)
+                    else:
+                        norm_distance = float('inf')
+
+                    # Calculate distances in pixel space
+                    pixel_dists = cdist(abs_preds, gt_abs_coords)
+                    if pixel_dists.size > 0:
+                        pixel_distance = np.min(pixel_dists)
+                    else:
+                        pixel_distance = float('inf')
+
+                    
+                    # Calculate quadrant accuracy
+                    def get_quadrant(point):
+                        x, y = point
+                        if x < 50 and y < 50:
+                            return 1  # Top-left
+                        elif x >= 50 and y < 50:
+                            return 2  # Top-right
+                        elif x < 50 and y >= 50:
+                            return 3  # Bottom-left
+                        else:
+                            return 4  # Bottom-right
+                    
+                    # Get closest pred point to gt point
+                    if norm_preds.size > 0 and gt_coord.size > 0:
+                        closest_pred_for_quadrant = norm_preds[np.unravel_index(np.argmin(norm_dists, axis=None), norm_dists.shape)[0]]
+                        pred_quadrant = get_quadrant(closest_pred_for_quadrant)
+                        gt_quadrant = get_quadrant(gt_coord[0])  # Assuming first gt point for quadrant
+                        quadrant_correct = pred_quadrant == gt_quadrant
+                    else:
+                        quadrant_correct = False
+                    
+                    scores["quadrant_accuracy"].append(float(quadrant_correct))
+                    
+                    # Log both distance metrics and quadrant info
+                    log.info(f"Distance - Normalized: {norm_distance:.2f}%, Pixel: {pixel_distance:.2f}px")
+                    log.info(f"Quadrants - Pred Quadrant for closest point: {pred_quadrant if norm_preds.size > 0 else 'N/A'}, GT Quadrant (first point): {gt_quadrant if gt_coord.size > 0 else 'N/A'}, Match: {quadrant_correct}")
+                    
+                    # Compute threshold as percentage of image dimensions
+                    threshold = self.threshold_percent
+                    
+                    # Binary accuracy (within threshold percentage)
+                    accuracy = float(norm_distance <= threshold)
+                    
+                    scores["accuracy"].append(accuracy)
+                    scores["distance_norm"].append(norm_distance)
+                    scores["distance_pixel"].append(pixel_distance)
+                    
+                    # Store absolute coordinates for visualization
+                    pred_points.append(abs_preds)
+                    gt_points.append(gt_abs_coords)
+                    processed += 1
+                    
+                except Exception as e:
+                    log.warning(f"Example {ex_ix}: Error processing: {str(e)}", exc_info=True)
+                    skipped += 1
+                    pred_points.append(None)
+                    gt_points.append(None)
+                
+            except Exception as e:
+                log.warning(f"Example {ex_ix}: Unexpected error: {str(e)}", exc_info=True)
+                skipped += 1
+                pred_points.append(None)
+                gt_points.append(None)
+            
+            # Log progress
+            if (ex_ix + 1) % 10 == 0:
+                elapsed = time.time() - start_time
+                log.info(f"Processed {ex_ix+1}/{len(new_tokens)} examples in {elapsed:.2f}s. " 
+                         f"Processed: {processed}, Skipped: {skipped}")
+        
+        # Log final counts
+        total_time = time.time() - start_time
+        log.info(f"PointProximityEval complete. Processed {processed}/{len(new_tokens)} examples in {total_time:.2f}s. "
+                 f"Skipped: {skipped}")
+        
+        # Calculate aggregate metrics
+        final_metrics = {}
+        
+        # Calculate mean metrics using the mean_metric helper
+        for key, value_list in scores.items():
+            # Filter out nan and inf values from the list for this key.
+            # The mean_metric function's internal use of np.mean() would produce NaN
+            # if the list contains NaN, and MeanMetric(nan_strategy="error") would then fail.
+            filtered_values = [v for v in value_list if not (math.isnan(v) or math.isinf(v))]
+            
+            # mean_metric handles empty filtered_values by creating a metric with sum 0.0 and weight 0
+            final_metrics[key] = mean_metric(filtered_values)
+        
+        # Create per-example scores for visualization (used by gather_examples_as_html)
+        # This should use the raw scores before they are aggregated into MeanMetric objects.
+        per_example_scores_for_html = []
+        if new_tokens: # Ensure new_tokens is not empty
+            num_examples_for_html_scores = len(new_tokens)
+            # Handle cases where not all score lists might have num_examples_for_html_scores items (e.g. due to skips)
+            # We'll create a list of dictionaries, one for each example that was attempted.
+            # If a score for a particular metric for a particular example doesn't exist (e.g. skipped), it won't be in its dict.
+            
+            # Determine the maximum index processed based on populated score lists
+            max_idx_in_scores = 0
+            if scores:
+                max_idx_in_scores = max(len(lst) for lst in scores.values() if lst) -1 if any(scores.values()) else -1
+
+            # Iterate up to the number of examples we expect, or the max index we have scores for
+            # This ensures we try to create an entry for each example that *might* have scores.
+            # The original code used range(len(new_tokens)) which might lead to IndexError if scores lists are shorter.
+            # However, per_example_scores is usually for examples that *were* processed to some extent.
+            # Let's align with len(new_tokens) which represents total attempts.
+            
+            for i in range(num_examples_for_html_scores):
+                example_score_dict = {}
+                for k in scores:
+                    if i < len(scores[k]):
+                        example_score_dict[k] = scores[k][i]
+                per_example_scores_for_html.append(example_score_dict)
+
+
+        # Add HTML visualization with images and points
+        if self.n_to_log and self.n_to_log > 0: # ensure n_to_log is positive
+            try:
+                log.info(f"Attempting to generate HTML report for {self.n_to_log} examples.")
+                html_table_output = gather_examples_as_html(
+                    self.n_to_log, vocab, metadatas, predictions,
+                    per_example_scores_for_html, pred_points=pred_points, gt_points=gt_points
+                )
+                # Ensure html_table_output is not None and has rows before adding it
+                if html_table_output is not None and hasattr(html_table_output, 'rows') and html_table_output.rows:
+                     final_metrics["predictions"] = html_table_output
+                     log.info("Successfully generated and added HTML report to final_metrics.")
+                else:
+                    log.warning("gather_examples_as_html did not return valid output or had no rows. HTML report will be missing.")
+            except Exception as e:
+                log.error(f"Error during HTML generation with gather_examples_as_html: {e}", exc_info=True)
+                # Optionally, put a placeholder or skip adding "predictions" to final_metrics
+                # final_metrics["predictions"] = "Error generating HTML report."
+                log.warning("HTML report generation failed. It will be missing from final_metrics.")
+        
+        return final_metrics
