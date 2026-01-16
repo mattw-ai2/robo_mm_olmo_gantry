@@ -99,9 +99,12 @@ def main():
     command = args.command
     beaker_name = args.name
 
-    # Sync code to gantry repo
+    # Sync code to gantry repo and change to it
     if not args.no_sync:
         sync_code_to_gantry_repo(beaker_name)
+    
+    # Gantry must run from the gantry repo directory
+    os.chdir(GANTRY_REPO)
 
     # Gantry configuration
     gantry_kwargs = dict(
