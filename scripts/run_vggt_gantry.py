@@ -114,7 +114,7 @@ def main():
         budget="ai2/oe-mm",
         gpus=args.gpus,
         shared_memory="16GiB",
-        beaker_image="chrisc/molmo-torch2.6.0-cuda12.6-video",
+        beaker_image="mattw-vggt-preprocess",
         workspace="ai2/robo-molmo",
         gh_token_secret=GITHUB_TOKEN_SECRET,
         description=f"VGGT preprocessing: {command[:100]}...",
@@ -129,7 +129,6 @@ def main():
     )
 
     env_secret = dict(
-        HF_ACCESS_TOKEN="MATTW_HF_TOKEN",
         BEAKER_TOKEN="MATTW_BEAKER_TOKEN",
     )
 
@@ -147,15 +146,9 @@ def main():
 
     # Build the full command with setup
     # Note: Gantry clones the repo, so we're already in the repo directory
+    # VGGT and dependencies are pre-installed in mattw-vggt-preprocess image
     setup_cmd = """
 set -e
-echo "=== Setting up environment ==="
-
-# Install VGGT and dependencies
-echo "Installing dependencies..."
-pip install decord h5py tqdm opencv-python-headless
-pip install git+https://github.com/facebookresearch/vggt.git
-
 echo "=== Starting preprocessing ==="
 """
     full_command = setup_cmd + command
