@@ -114,7 +114,7 @@ def main():
         budget="ai2/oe-mm",
         gpus=args.gpus,
         shared_memory="16GiB",
-        beaker_image="mattw-vggt-preprocess",
+        beaker_image="mattw/mattw-vggt-preprocess",
         workspace="ai2/robo-molmo",
         gh_token_secret=GITHUB_TOKEN_SECRET,
         description=f"VGGT preprocessing: {command[:100]}...",
